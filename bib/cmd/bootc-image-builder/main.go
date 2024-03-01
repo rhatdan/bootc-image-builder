@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/osbuild/bootc-image-builder/bib/internal/setup"
 	"github.com/osbuild/images/pkg/arch"
@@ -19,6 +20,7 @@ import (
 	"github.com/osbuild/images/pkg/rpmmd"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	"golang.org/x/exp/slices"
 )
 
 //go:embed fedora-eln.json
@@ -182,7 +184,7 @@ func manifestFromCobra(cmd *cobra.Command, args []string) ([]byte, error) {
 	rpmCacheRoot, _ := cmd.Flags().GetString("rpmmd")
 	configFile, _ := cmd.Flags().GetString("config")
 	tlsVerify, _ := cmd.Flags().GetBool("tls-verify")
-	imgType, _ := cmd.Flags().GetString("type")
+	imgTypes, _ := cmd.Flags().GetStringArray("type")
 	targetArch, _ := cmd.Flags().GetString("target-arch")
 	if targetArch != "" {
 		// TODO: detect if binfmt_misc for target arch is
@@ -191,7 +193,7 @@ func manifestFromCobra(cmd *cobra.Command, args []string) ([]byte, error) {
 		// including tiny statically linked target-arch
 		// binaries inside our bib container
 		fmt.Fprintf(os.Stderr, "WARNING: target-arch is experimental and needs an installed 'qemu-user' package\n")
-		if imgType == "iso" {
+		if slices.Contains(imgTypes, "iso") {
 			return nil, fmt.Errorf("cannot build iso for different target arches yet")
 		}
 		buildArch = arch.FromString(targetArch)
@@ -210,7 +212,7 @@ func manifestFromCobra(cmd *cobra.Command, args []string) ([]byte, error) {
 
 	manifestConfig := &ManifestConfig{
 		Imgref:       imgref,
-		ImgType:      imgType,
+		ImgType:      imgTypes[0],
 		Config:       config,
 		Repos:        repos,
 		Architecture: buildArch,
@@ -231,7 +233,7 @@ func cmdManifest(cmd *cobra.Command, args []string) error {
 func cmdBuild(cmd *cobra.Command, args []string) error {
 	outputDir, _ := cmd.Flags().GetString("output")
 	osbuildStore, _ := cmd.Flags().GetString("store")
-	imgType, _ := cmd.Flags().GetString("type")
+	imgTypes, _ := cmd.Flags().GetStringArray("type")
 	targetArch, _ := cmd.Flags().GetString("target-arch")
 
 	if err := setup.Validate(); err != nil {
@@ -247,8 +249,8 @@ func cmdBuild(cmd *cobra.Command, args []string) error {
 
 	upload := false
 	if region, _ := cmd.Flags().GetString("aws-region"); region != "" {
-		if imgType != "ami" {
-			return fmt.Errorf("aws flags set for non-ami image type (type is set to %s)", imgType)
+		if !slices.Contains(imgTypes, "ami") {
+			return fmt.Errorf("aws flags set for non-ami image type (type is set to %s)", strings.Join(imgTypes, ","))
 		}
 		// initialise the client to check if the env vars exist before building the image
 		client, err := awscloud.NewDefault(region)
@@ -268,25 +270,13 @@ func cmdBuild(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	manifest_fname := fmt.Sprintf("manifest-%s.json", imgType)
+	manifest_fname := fmt.Sprintf("manifest-%s.json", imgTypes[0])
 	fmt.Printf("Generating %s ... ", manifest_fname)
 	mf, err := manifestFromCobra(cmd, args)
 	if err != nil {
 		panic(err)
 	}
 	fmt.Print("DONE\n")
-
-	var exports []string
-	switch imgType {
-	case "qcow2":
-		exports = []string{"qcow2"}
-	case "ami", "raw":
-		exports = []string{"image"}
-	case "anaconda-iso", "iso":
-		exports = []string{"bootiso"}
-	default:
-		return fmt.Errorf("valid types are 'qcow2', 'ami', 'raw', 'anaconda-iso', not: '%s'", imgType)
-	}
 
 	manifestPath := filepath.Join(outputDir, manifest_fname)
 	if err := saveManifest(mf, manifestPath); err != nil {
@@ -300,21 +290,23 @@ func cmdBuild(cmd *cobra.Command, args []string) error {
 		// set export options for osbuild
 		osbuildEnv = []string{"OSBUILD_EXPORT_FORCE_NO_PRESERVE_OWNER=1"}
 	}
-	_, err = osbuild.RunOSBuild(mf, osbuildStore, outputDir, exports, nil, osbuildEnv, false, os.Stderr)
+	_, err = osbuild.RunOSBuild(mf, osbuildStore, outputDir, imgTypes, nil, osbuildEnv, false, os.Stderr)
 	if err != nil {
 		return err
 	}
 
 	fmt.Println("Build complete!")
 	if upload {
-		switch imgType {
-		case "ami":
-			diskpath := filepath.Join(outputDir, exports[0], "disk.raw")
-			if err := uploadAMI(diskpath, targetArch, cmd.Flags()); err != nil {
-				return err
+		for _, imgType := range imgTypes {
+			switch imgType {
+			case "ami":
+				diskpath := filepath.Join(outputDir, imgType, "disk.raw")
+				if err := uploadAMI(diskpath, targetArch, cmd.Flags()); err != nil {
+					return err
+				}
+			default:
+				continue
 			}
-		default:
-			return fmt.Errorf("upload set but image type %s doesn't support uploading", imgType)
 		}
 	} else {
 		fmt.Printf("Results saved in\n%s\n", outputDir)
@@ -348,7 +340,7 @@ func run() error {
 	rootCmd.AddCommand(manifestCmd)
 	manifestCmd.Flags().String("rpmmd", "/rpmmd", "rpm metadata cache directory")
 	manifestCmd.Flags().String("config", "", "build config file")
-	manifestCmd.Flags().String("type", "qcow2", "image type to build [qcow2, ami]")
+	manifestCmd.Flags().StringArray("type", []string{"qcow2"}, "image type to build [qcow2, ami]")
 	manifestCmd.Flags().Bool("tls-verify", true, "require HTTPS and verify certificates when contacting registries")
 	manifestCmd.Flags().String("target-arch", "", "build for the given target architecture (experimental)")
 
